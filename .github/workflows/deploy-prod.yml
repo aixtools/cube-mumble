@@ -424,12 +424,43 @@ jobs:
       - name: Restart services
         run: |
           set -euo pipefail
-          ssh -p "${DEPLOY_TARGET_PORT}" -i ~/.ssh/deploy_key "${DEPLOY_TARGET_USER}@${DEPLOY_TARGET_HOST}" \
-            "sudo systemctl restart mumble-bg-auth mumble-bg-control"
+          ssh -p "${DEPLOY_TARGET_PORT}" -i ~/.ssh/deploy_key "${DEPLOY_TARGET_USER}@${DEPLOY_TARGET_HOST}" bash -s <<'EOF'
+          set -euo pipefail
+          # mumble-bg-auth only drives Ice-backed Murmur servers; it exits 1 when
+          # no Ice authenticator registers. Hosts that have migrated to the
+          # shitspeak driver disable the unit, so restarting it unconditionally
+          # drops them back into a crash loop. Honour what the host has enabled.
+          # is-enabled/list-unit-files are read-only and need no sudo; restart is
+          # issued per-unit so it matches the per-unit NOPASSWD sudoers rules.
+          for unit in mumble-bg-auth mumble-bg-control; do
+            if ! systemctl list-unit-files "${unit}.service" >/dev/null 2>&1; then
+              echo "[restart] ${unit}: not installed; skipping."
+            elif ! systemctl is-enabled "${unit}" >/dev/null 2>&1; then
+              echo "[restart] ${unit}: disabled on this host; skipping."
+            else
+              sudo systemctl restart "${unit}"
+              echo "[restart] ${unit}: restarted."
+            fi
+          done
+          EOF
 
       - name: Health check
         run: |
           set -euo pipefail
           sleep 3
-          ssh -p "${DEPLOY_TARGET_PORT}" -i ~/.ssh/deploy_key "${DEPLOY_TARGET_USER}@${DEPLOY_TARGET_HOST}" \
-            "sudo systemctl is-active mumble-bg-auth && sudo systemctl is-active mumble-bg-control"
+          ssh -p "${DEPLOY_TARGET_PORT}" -i ~/.ssh/deploy_key "${DEPLOY_TARGET_USER}@${DEPLOY_TARGET_HOST}" bash -s <<'EOF'
+          set -euo pipefail
+          checked=0
+          for unit in mumble-bg-auth mumble-bg-control; do
+            if systemctl is-enabled "${unit}" >/dev/null 2>&1; then
+              sudo systemctl is-active "${unit}"
+              checked=$((checked + 1))
+            else
+              echo "[health] ${unit}: disabled on this host; skipping."
+            fi
+          done
+          if [ "${checked}" -eq 0 ]; then
+            echo "[health] no enabled mumble-bg units to check." >&2
+            exit 1
+          fi
+          EOF
